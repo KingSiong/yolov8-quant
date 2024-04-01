@@ -39,7 +39,7 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, default=ROOT / 'ultralytics/cfg/datasets/coco8.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default=ROOT / 'ultralytics/cfg/datasets/coco.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov8n.pt', help='model.pt path(s)')
     parser.add_argument('--model-name', '-m', default='yolov8n', help='model name: default yolov8s')
     parser.add_argument('--epoch', type=int, default=1, help='train epoch num')
@@ -152,8 +152,9 @@ def main(opt):
             device=device)
         
     if opt.num_calib_batch > 0: 
-        map, map50, map75 = evaluate_accuracy(model, opt)
-        print(f'[INFO] after PTQ, mAP50: {map50}  mAP50-95: {map}')
+        with torch.no_grad():
+            map, map50, map75 = evaluate_accuracy(model, opt)
+            print(f'[INFO] after PTQ, mAP50: {map50}  mAP50-95: {map}')
 
     # TODO: skip some layers which is sensitive
     # ...
