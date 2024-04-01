@@ -157,6 +157,10 @@ class BaseTrainer:
         if RANK in (-1, 0):
             callbacks.add_integration_callbacks(self)
 
+        # QAT preloaded model
+        if 'model' in overrides.keys():
+            self.model = overrides['model']
+
     def add_callback(self, event: str, callback):
         """Appends the given callback."""
         self.callbacks[event].append(callback)
@@ -515,6 +519,8 @@ class BaseTrainer:
 
         model, weights = self.model, None
         ckpt = None
+        if isinstance(self.model, nn.Module):
+            return ckpt
         if str(model).endswith(".pt"):
             weights, ckpt = attempt_load_one_weight(model)
             cfg = ckpt["model"].yaml
