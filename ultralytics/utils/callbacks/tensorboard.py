@@ -55,7 +55,9 @@ def on_pretrain_routine_start(trainer):
 def on_train_start(trainer):
     """Log TensorBoard graph."""
     if WRITER:
-        _log_tensorboard_graph(trainer)
+        # close tensorboard
+        # _log_tensorboard_graph(trainer)
+        pass
 
 
 def on_train_epoch_end(trainer):
