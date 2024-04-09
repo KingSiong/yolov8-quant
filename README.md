@@ -6,12 +6,12 @@ my demo is based on [v8.1.0](https://github.com/ultralytics/ultralytics/releases
 
 - [x] finish ptq and debug
 - [x] finish qat
-- [] add q/dq manually
+- [ ] add q/dq manually
 - [x] sensitivity analysis
-- [] skip some sensitive layers
-- [] quant details... (fuse? amax?)
-- [] some warnings/errors(may not affect the results) wait to fix (tracer, onnx export...)
-- [] export format onnx to engine for tensorrt to inference
+- [ ] skip some sensitive layers
+- [ ] quant details... (fuse? amax?)
+- [ ] some warnings/errors(may not affect the results) wait to fix (tracer, onnx export...)
+- [ ] export format onnx to engine for tensorrt to inference
 
 ### Quick Start
 ```shell
