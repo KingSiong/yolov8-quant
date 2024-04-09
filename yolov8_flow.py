@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 import torch
+from copy import deepcopy
 
 try:
     from pytorch_quantization import nn as quant_nn
@@ -19,7 +20,7 @@ except ImportError:
 from utils import collect_stats, compute_amax
 
 from ultralytics.nn.modules.head import Detect
-from ultralytics.nn.tasks import DetectionModel
+from ultralytics.nn.tasks import DetectionModel, attempt_load_one_weight
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.models.yolo.detect import DetectionValidator, DetectionTrainer
 from ultralytics.utils.checks import check_imgsz, check_yaml
@@ -29,7 +30,7 @@ from ultralytics.utils.files import file_size
 from ultralytics.utils.torch_utils import select_device
 from ultralytics.data import build_dataloader
 
-from utils import calibrate_model, disable_quantization
+from utils import calibrate_model, disable_quantization, save_model
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
@@ -40,14 +41,15 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 def parse_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, default=ROOT / 'ultralytics/cfg/datasets/coco128.yaml', help='dataset.yaml path')
-    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov8n.pt', help='model.pt path(s)')
+    parser.add_argument('--cfg', type=str, default=ROOT / 'yolov8n.yaml', help='model cfg path')
+    parser.add_argument('--weight', type=str, default=ROOT / 'yolov8n.pt', help='model.pt path')
     parser.add_argument('--model-name', '-m', default='yolov8n', help='model name: default yolov8n')
-    parser.add_argument('--epoch', type=int, default=1, help='train epoch num')
-    parser.add_argument('--train-batch-size', type=int, default=32, help='train batch size')
-    parser.add_argument('--val-batch-size', type=int, default=32, help='val batch size')
-    parser.add_argument('--calib-batch-size', type=int, default=32, help='calib batch size')
+    parser.add_argument('--epoch', type=int, default=5, help='train epoch num')
+    parser.add_argument('--train-batch-size', type=int, default=64, help='train batch size')
+    parser.add_argument('--val-batch-size', type=int, default=64, help='val batch size')
+    parser.add_argument('--calib-batch-size', type=int, default=64, help='calib batch size')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--device', default='3', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--device', default='4', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--workers', type=int, default=0, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='--cache images in "ram" (default) or "disk"')
 
@@ -66,39 +68,54 @@ def parse_opt():
     opt.data = check_yaml(opt.data)  # check YAML
     return opt
 
-def load_model(weight, device) -> DetectionModel:
-    model = torch.load(weight, map_location=device)['model']
-    model.float()
-    model.eval()
-    with torch.no_grad():
-        model.fuse()
+def load_model(cfg, weight) -> DetectionModel:
+    '''
+    load model from cfg / weight
+    do not use cfg when loading a model with non-dynamic amax
+    '''
+    if weight:
+        weight, ckpt = attempt_load_one_weight(weight=weight)
+    else:
+        weight = None
+
+    if cfg:
+        model = DetectionModel(cfg=cfg)
+        if weight:
+            model.load(weights=weight)
+    else:
+        model = weight
+
     return model
 
-def get_model(calibrator, weight, device):
+def get_model(calibrator, weight, cfg):
 
-    if calibrator == None:
-        model = load_model(weight, device)
-        model.eval()
-        model.cuda()
-        return model
+    if calibrator:
+        # use calibrator to initialze model
+        # use monkey patch to add fake-quant ops
+        quant_desc_input = QuantDescriptor(calib_method=calibrator)
+        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
     
-    quant_desc_input = QuantDescriptor(calib_method=calibrator)
-    quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
-    quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
-    quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
-    quant_modules.initialize()
-    model = load_model(weight, device)
-    quant_modules.deactivate()
+        quant_modules.initialize()
+    
+    model = load_model(cfg, weight)
+    
+    if calibrator:
+        quant_modules.deactivate()
+    
     model.eval()
     model.cuda()
 
     return model
 
-def get_dataloader(opt, model):
+def get_dataloader(opt, model, batch_size, key='train', prefix='calib: ', shuffle=False):
+    '''
+    get dataloader with yolov8's api
+    '''
     data_dict = check_det_dataset(opt.data)
-    calib_path = data_dict['train']
+    data_path = data_dict[key]
 
-    # Check imgsz
     gs = max(int(model.stride.max() if hasattr(model, 'stride') else 32), 32)  # grid size (max stride)
     imgsz = check_imgsz(opt.imgsz, stride=gs, floor=gs, max_dim=1)
     
@@ -106,20 +123,20 @@ def get_dataloader(opt, model):
     from ultralytics.utils import DEFAULT_CFG
     args = get_cfg(cfg=DEFAULT_CFG, overrides=None)
     
-    calib_dataset = YOLODataset(img_path=calib_path,
+    dataset = YOLODataset(img_path=data_path,
                           imgsz=imgsz,
-                          batch_size=opt.calib_batch_size,
+                          batch_size=batch_size,
                           augment=False,
                           hyp=args,
                           rect=True,
                           cache=opt.cache,
                           stride=gs,
                           pad=0.5,
-                          prefix=colorstr('calib: '))
+                          prefix=colorstr(prefix))
 
-    calib_loader = build_dataloader(calib_dataset, opt.calib_batch_size, opt.workers, shuffle=False, rank=-1) # bug exists when shuffle is true
+    data_loader = build_dataloader(dataset, batch_size, opt.workers, shuffle=shuffle, rank=-1) # TODO: bug exists when shuffle is true
 
-    return calib_loader
+    return data_loader
 
 def train(model, opt):
     args = dict(mode='train', 
@@ -132,9 +149,15 @@ def train(model, opt):
                 amp=False)
     trainer = DetectionTrainer(overrides=args)
     trainer.train()
+    # get metrics
+    metrics = trainer.metrics
+    map50 = metrics['metrics/mAP50(B)']    # map50
+    map = metrics['metrics/mAP50-95(B)'] # map50-95
+    print(f'[INFO] before quantization, mAP50: {map50}  mAP50-95: {map}')
 
-def evaluate_accuracy(model, opt):
-    args = dict(mode='val', model=model, data=opt.data, imgsz=opt.imgsz, batch=opt.val_batch_size, project=opt.out_dir)
+def evaluate_accuracy(model, opt, batch_size):
+    model_copy = deepcopy(model)
+    args = dict(mode='val', model=model_copy, data=opt.data, imgsz=opt.imgsz, batch=batch_size, project=opt.out_dir)
     validator = DetectionValidator(args=args)
     validator()
     metrics = validator.metrics
@@ -148,17 +171,16 @@ def evaluate_accuracy(model, opt):
 def main(opt):
     print('[INFO] Loading model...')
     device = select_device(opt.device, opt.train_batch_size)
-    model = get_model(calibrator=opt.calibrator, weight=opt.weights, device=device)
-    calib_loader = get_dataloader(opt=opt, model=model)
-
-    # print(model)
+    model = get_model(calibrator=opt.calibrator, cfg=opt.cfg, weight=opt.weight)
+    calib_loader = get_dataloader(opt=opt, model=model, batch_size=opt.calib_batch_size)
 
     with torch.no_grad():
         with disable_quantization(model):
-            map, map50, map75 = evaluate_accuracy(model, opt)
+            map, map50, map75 = evaluate_accuracy(model, opt, batch_size=opt.val_batch_size)
             print(f'[INFO] before quantization, mAP50: {map50}  mAP50-95: {map}')
 
     if opt.num_calib_batch > 0: 
+        # PTQ is activated when num-calib-batch > 0
         with torch.no_grad():
             print('[INFO] PTQ starting...')
             calibrate_model(
@@ -171,33 +193,11 @@ def main(opt):
                 out_dir=opt.out_dir,
                 device=device)
         
-            map, map50, map75 = evaluate_accuracy(model, opt)
+            map, map50, map75 = evaluate_accuracy(model, opt, batch_size=opt.val_batch_size)
             print(f'[INFO] after PTQ, mAP50: {map50}  mAP50-95: {map}')
 
-    # TODO: skip some layers which is sensitive
-    # ...
-
-    # for debug...
-    # weight = opt.out_dir / f'{opt.model_name}-max-{opt.num_calib_batch * calib_loader.batch_size}.pth'
-    # # weight = '/home/sjs/yolov8-8.1.0-qat/runs/train34/weights/best.pt'
-    # # weight = '/home/sjs/yolov8-8.1.0-qat/runs/train37/weights/best.pt'
-    # print(weight)
-    # model = get_model(calibrator=None, weight=weight, device=device)
-    # print(model)
-    # # print(f'[INFO] load the model(after PTQ)...')
-    # map, map50, map75 = evaluate_accuracy(model, opt)
-    # print(f'[INFO] after PTQ, mAP50: {map50}  mAP50-95: {map}')
-
-    # weight = opt.out_dir / f'{opt.model_name}-max-{opt.num_calib_batch * calib_loader.batch_size}.pth'
-    # # weight = '/home/sjs/yolov8-8.1.0-qat/runs/train34/weights/best.pt'
-    # weight = '/home/sjs/yolov8-8.1.0-qat/runs/train43/weights/best.pt'
-    # print(weight)
-    # model = get_model(calibrator=None, weight=weight, device=device)
-    # print(model)
-    # print(f'[INFO] load the model(after PTQ)...')
-    # with torch.no_grad():
-    #     map, map50, map75 = evaluate_accuracy(model, opt)
-    #     print(f'[INFO] after PTQ, mAP50: {map50}  mAP50-95: {map}')
+            # save model with yolov8's api
+            save_model(model, opt.out_dir / f'{opt.model_name}-max-{opt.num_calib_batch * calib_loader.batch_size}.pt')
 
     if opt.qat:
         print('[INFO] QAT starting...')
