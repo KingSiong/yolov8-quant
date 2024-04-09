@@ -1,6 +1,8 @@
 import torch
 import os
+import json
 from tqdm import tqdm
+from absl import logging
 from copy import deepcopy
 from ultralytics.utils.torch_utils import de_parallel
 
@@ -127,3 +129,29 @@ def save_model(model, path):
     }
 
     torch.save(ckpt, path)
+
+def export_onnx(model, onnx_filename, device, dynamic_batch=True):
+    model.eval()
+
+    quant_nn.TensorQuantizer.use_fb_fake_quant = True
+
+    print(f'Creating ONNX file: {onnx_filename}')
+    input_dummy = torch.randn(1, 3, 640, 640, device=device)
+
+    try:
+        import onnx
+        with torch.no_grad():
+            torch.onnx.export(model, input_dummy, onnx_filename, opset_version=13,
+                          input_names=['input'], output_names=['output'],
+                          dynamic_axes={'input': {0: 'batch'}, 'output': {0: 'batch'}} if dynamic_batch else None)
+
+        onnx_model = onnx.load(onnx_filename)  # load onnx model
+        onnx.checker.check_model(onnx_model)  # check onnx model
+        print(f'ONNX export successful, saved as {onnx_filename}')
+    except ValueError:
+        logging.WARNING('Failed to export to ONNX')
+        return False
+
+    quant_nn.TensorQuantizer.use_fb_fake_quant = False
+
+    return True
