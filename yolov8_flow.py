@@ -30,7 +30,8 @@ from ultralytics.utils.files import file_size
 from ultralytics.utils.torch_utils import select_device
 from ultralytics.data import build_dataloader
 
-from utils import calibrate_model, disable_quantization, save_model
+from utils import calibrate_model, disable_quantization, enable_quantization, \
+        save_model, export_onnx
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
@@ -44,19 +45,19 @@ def parse_opt():
     parser.add_argument('--cfg', type=str, default=ROOT / 'yolov8n.yaml', help='model cfg path')
     parser.add_argument('--weight', type=str, default=ROOT / 'yolov8n.pt', help='model.pt path')
     parser.add_argument('--model-name', '-m', default='yolov8n', help='model name: default yolov8n')
-    parser.add_argument('--epoch', type=int, default=5, help='train epoch num')
-    parser.add_argument('--train-batch-size', type=int, default=64, help='train batch size')
-    parser.add_argument('--val-batch-size', type=int, default=64, help='val batch size')
-    parser.add_argument('--calib-batch-size', type=int, default=64, help='calib batch size')
+    parser.add_argument('--epoch', type=int, default=50, help='train epoch num')
+    parser.add_argument('--train-batch-size', type=int, default=32, help='train batch size')
+    parser.add_argument('--val-batch-size', type=int, default=32, help='val batch size')
+    parser.add_argument('--calib-batch-size', type=int, default=32, help='calib batch size')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--device', default='4', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--workers', type=int, default=0, help='max dataloader workers (per RANK in DDP mode)')
     parser.add_argument('--cache', type=str, nargs='?', const='ram', help='--cache images in "ram" (default) or "disk"')
 
-    # setting for calibration
-    parser.add_argument('--sensitive-layer', default=['model.22.dfl.conv',
-                                                      'model.2.cv1.conv'], help='skip sensitive layer: default detect head and second layer')
-    parser.add_argument('--num-calib-batch', default=1, type=int, help='Number of batches for calibration. 0 will disable calibration. (default: 4)')
+    parser.add_argument('--sensitivity', action='store_true', help='use sensitive analysis')
+    # parser.add_argument('--sensitive-layer', default=['model.22.dfl.conv',
+                                                    #   'model.2.cv1.conv'], help='skip sensitive layer: default detect head and second layer')
+    parser.add_argument('--num-calib-batch', default=10, type=int, help='Number of batches for calibration. 0 will disable calibration. (default: 4)')
     parser.add_argument('--calibrator', type=str, choices=["max", "histogram"], default="max")
     parser.add_argument('--percentile', nargs='+', type=float, default=[99.9, 99.99, 99.999, 99.9999])
     parser.add_argument('--dynamic', default=False, help='dynamic ONNX axes')
@@ -154,6 +155,7 @@ def train(model, opt):
     map50 = metrics['metrics/mAP50(B)']    # map50
     map = metrics['metrics/mAP50-95(B)'] # map50-95
     print(f'[INFO] after QAT, mAP50: {map50}  mAP50-95: {map}')
+    model = load_model(None, trainer.best)
 
 def evaluate_accuracy(model, opt, batch_size):
     model_copy = deepcopy(model)
@@ -167,6 +169,33 @@ def evaluate_accuracy(model, opt, batch_size):
     # maps = metrics.box.maps 
     
     return map, map50, map75
+
+def build_sensitivity_profile(model, opt, batch_size):
+    '''
+    from https://github.com/NVIDIA/TensorRT/blob/master/tools/pytorch-quantization/examples/torchvision/classification_flow.py#L422
+    evaluate every quant layer independently
+    the higher score, the more sensitive
+    TODO: when to skip the layers? before or after? how?
+    '''
+    quant_layer_names = []
+    for name, module in model.named_modules():
+        if name.endswith("_quantizer"):
+            module.disable()
+            layer_name = name.replace("._input_quantizer", "").replace("._weight_quantizer", "")
+            if layer_name not in quant_layer_names:
+                quant_layer_names.append(layer_name)
+    for i, quant_layer in enumerate(quant_layer_names):
+        print("Enable", quant_layer)
+        for name, module in model.named_modules():
+            if name.endswith("_quantizer") and quant_layer in name:
+                module.enable()
+                print(F"{name:40}: {module}")
+        with torch.no_grad():
+            evaluate_accuracy(model, opt, batch_size)
+        for name, module in model.named_modules():
+            if name.endswith("_quantizer") and quant_layer in name:
+                module.disable()
+                print(F"{name:40}: {module}")
 
 def main(opt):
     print('[INFO] Loading model...')
@@ -199,9 +228,16 @@ def main(opt):
             # save model with yolov8's api
             save_model(model, opt.out_dir / f'{opt.model_name}-max-{opt.num_calib_batch * calib_loader.batch_size}.pt')
 
+    # sensitive analysis
+    if opt.sensitivity:
+        build_sensitivity_profile(model, opt, opt.val_batch_size)
+
     if opt.qat:
         print('[INFO] QAT starting...')
         train(model, opt)
+
+    onnx_filename = opt.out_dir / (opt.model_name + ".onnx")
+    export_onnx(model, onnx_filename, device)
 
 if __name__ == "__main__":
     opt = parse_opt()
