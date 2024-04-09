@@ -153,7 +153,7 @@ def train(model, opt):
     metrics = trainer.metrics
     map50 = metrics['metrics/mAP50(B)']    # map50
     map = metrics['metrics/mAP50-95(B)'] # map50-95
-    print(f'[INFO] before quantization, mAP50: {map50}  mAP50-95: {map}')
+    print(f'[INFO] after QAT, mAP50: {map50}  mAP50-95: {map}')
 
 def evaluate_accuracy(model, opt, batch_size):
     model_copy = deepcopy(model)
