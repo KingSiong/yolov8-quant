@@ -41,11 +41,11 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, default=ROOT / 'ultralytics/cfg/datasets/coco128.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default=ROOT / 'ultralytics/cfg/datasets/coco.yaml', help='dataset.yaml path')
     parser.add_argument('--cfg', type=str, default=ROOT / 'yolov8n.yaml', help='model cfg path')
     parser.add_argument('--weight', type=str, default=ROOT / 'yolov8n.pt', help='model.pt path')
     parser.add_argument('--model-name', '-m', default='yolov8n', help='model name: default yolov8n')
-    parser.add_argument('--epoch', type=int, default=50, help='train epoch num')
+    parser.add_argument('--epoch', type=int, default=1, help='train epoch num')
     parser.add_argument('--train-batch-size', type=int, default=32, help='train batch size')
     parser.add_argument('--val-batch-size', type=int, default=32, help='val batch size')
     parser.add_argument('--calib-batch-size', type=int, default=32, help='calib batch size')
@@ -69,7 +69,7 @@ def parse_opt():
     opt.data = check_yaml(opt.data)  # check YAML
     return opt
 
-def load_model(cfg, weight) -> DetectionModel:
+def load_model(cfg, weight, fuse=False) -> DetectionModel:
     '''
     load model from cfg / weight
     do not use cfg when loading a model with non-dynamic amax
@@ -85,6 +85,10 @@ def load_model(cfg, weight) -> DetectionModel:
             model.load(weights=weight)
     else:
         model = weight
+
+    if fuse:
+        with torch.no_grad():
+            model.fuse()
 
     return model
 
